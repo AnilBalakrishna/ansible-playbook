@@ -1,0 +1,219 @@
+- name: Deploy Apache Container with Custom Network Configuration
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  become: false
+  
+  vars:
+    # Container configuration variables
+    container_name: apache_web
+    docker_image: httpd:latest
+    network_name: apache_network
+    network_subnet: 172.168.10.0/30
+    network_gateway: 172.168.10.1
+    container_ip: 172.168.10.2
+    host_port: 8080
+    container_port: 80
+    static_file_source: index.html
+    static_file_dest: /usr/local/apache2/htdocs/index.html
+    restart_policy: always
+    
+  tasks:
+    - name: Display deployment information
+      debug:
+        msg: |
+          Starting Apache container deployment with the following configuration:
+          - Container Name: {{ container_name }}
+          - Docker Image: {{ docker_image }}
+          - Network: {{ network_name }} ({{ network_subnet }})
+          - Gateway: {{ network_gateway }}
+          - Container IP: {{ container_ip }}
+          - Port Mapping: {{ host_port }}:{{ container_port }}
+          - Restart Policy: {{ restart_policy }}
+
+    - name: Check if Docker is installed and running
+      command: docker info
+      register: docker_status
+      failed_when: docker_status.rc != 0
+      changed_when: false
+      tags: [validation]
+
+    - name: Verify static HTML file exists
+      stat:
+        path: "{{ static_file_source }}"
+      register: html_file_stat
+      failed_when: not html_file_stat.stat.exists
+      tags: [validation]
+
+    - name: Pull Apache Docker image
+      community.docker.docker_image:
+        name: "{{ docker_image }}"
+        source: pull
+        state: present
+        force_source: true
+      register: image_pull_result
+      tags: [image]
+
+    - name: Display image pull results
+      debug:
+        msg: "Apache image pull completed: {{ image_pull_result.changed }}"
+      tags: [image]
+
+    - name: Remove existing Apache container (if exists)
+      community.docker.docker_container:
+        name: "{{ container_name }}"
+        state: absent
+        force_kill: true
+      ignore_errors: true
+      tags: [cleanup]
+
+    - name: Remove existing Docker network (if exists)
+      community.docker.docker_network:
+        name: "{{ network_name }}"
+        state: absent
+        force: true
+      ignore_errors: true
+      tags: [cleanup]
+
+    - name: Create custom Docker bridge network with correct gateway
+      community.docker.docker_network:
+        name: "{{ network_name }}"
+        driver: bridge
+        ipam_config:
+          - subnet: "{{ network_subnet }}"
+            gateway: "{{ network_gateway }}"
+        state: present
+      register: network_creation
+      tags: [network]
+
+    - name: Display network creation results
+      debug:
+        msg: |
+          Network creation completed:
+          - Network Name: {{ network_name }}
+          - Subnet: {{ network_subnet }}
+          - Gateway: {{ network_gateway }}
+          - Status: {{ 'Created' if network_creation.changed else 'Already exists' }}
+      tags: [network]
+
+    - name: Deploy Apache container with custom configuration
+      community.docker.docker_container:
+        name: "{{ container_name }}"
+        image: "{{ docker_image }}"
+        state: started
+        restart_policy: "{{ restart_policy }}"
+        ports:
+          - "{{ host_port }}:{{ container_port }}"
+        networks:
+          - name: "{{ network_name }}"
+            ipv4_address: "{{ container_ip }}"
+        networks_cli_compatible: false
+        pull: false
+        detach: true
+        interactive: false
+        tty: false
+        cleanup: false
+        memory: "512m"
+        cpu_quota: 50000
+        healthcheck:
+          test: ["CMD", "curl", "-f", "http://localhost:{{ container_port }}"]
+          interval: 30s
+          timeout: 10s
+          retries: 3
+          start_period: 40s
+      register: container_deployment
+      tags: [container]
+
+    - name: Wait for Apache container to be fully started
+      wait_for:
+        host: localhost
+        port: "{{ host_port }}"
+        delay: 5
+        timeout: 60
+        state: started
+      tags: [container]
+
+    - name: Copy static HTML file to Apache container
+      community.docker.docker_container_copy_into:
+        container: "{{ container_name }}"
+        path: "{{ static_file_source }}"
+        container_path: "{{ static_file_dest }}"
+        mode: '0644'
+        owner_id: 0
+        group_id: 0
+      register: file_copy_result
+      tags: [content]
+
+    - name: Restart Apache container to ensure new content is served
+      community.docker.docker_container:
+        name: "{{ container_name }}"
+        state: started
+        restart: true
+      when: file_copy_result.changed
+      tags: [content]
+
+    - name: Verify container is running and healthy
+      community.docker.docker_container_info:
+        name: "{{ container_name }}"
+      register: container_info
+      tags: [verification]
+
+    - name: Display container status
+      debug:
+        msg: |
+          Container Status:
+          - Name: {{ container_info.container.Name }}
+          - State: {{ container_info.container.State.Status }}
+          - Health: {{ container_info.container.State.Health.Status | default('N/A') }}
+          - IP Address: {{ container_info.container.NetworkSettings.Networks[network_name].IPAddress }}
+          - Port Mapping: {{ container_info.container.NetworkSettings.Ports }}
+      tags: [verification]
+
+    - name: Test Apache service availability
+      uri:
+        url: "http://localhost:{{ host_port }}"
+        method: GET
+        status_code: 200
+        timeout: 10
+      register: service_test
+      retries: 3
+      delay: 5
+      tags: [verification]
+
+    - name: Display service test results
+      debug:
+        msg: |
+          Service Test Results:
+          - Status Code: {{ service_test.status }}
+          - Response Size: {{ service_test.content_length | default('Unknown') }} bytes
+          - Service URL: http://localhost:{{ host_port }}
+          - Content Preview: {{ service_test.content[:100] | default('No content') }}...
+      tags: [verification]
+
+    - name: Generate deployment summary
+      debug:
+        msg: |
+          ╔══════════════════════════════════════════════════════════════╗
+          ║                    DEPLOYMENT COMPLETED                     ║
+          ╠══════════════════════════════════════════════════════════════╣
+          ║ Container Name: {{ container_name }}                           
+          ║ Network: {{ network_name }} ({{ network_subnet }})            
+          ║ Gateway: {{ network_gateway }}                                
+          ║ Container IP: {{ container_ip }}                              
+          ║ Service URL: http://localhost:{{ host_port }}                 
+          ║ Status: {{ container_info.container.State.Status }}           
+          ║                                                              ║
+          ║ Verification Commands:                                       ║
+          ║   curl http://localhost:{{ host_port }}                       
+          ║   docker ps | grep {{ container_name }}                       
+          ║   docker logs {{ container_name }}                            
+          ║   docker network inspect {{ network_name }}                   
+          ╚══════════════════════════════════════════════════════════════╝
+      tags: [summary]
+
+  handlers:
+    - name: restart apache container
+      community.docker.docker_container:
+        name: "{{ container_name }}"
+        state: started
+        restart: true
